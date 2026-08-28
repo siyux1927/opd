@@ -158,10 +158,15 @@ def plot_cost_curve(summaries: dict[str, dict], out: Path, metric: str) -> None:
         payload = summaries.get(run)
         if not payload or not payload.get("history"):
             continue
-        pts = [(h.get("minutes", 0.0), h[metric]) for h in payload["history"] if metric in h]
+        pts = [(h.get("minutes", 0.0), h[metric], h.get("step")) for h in payload["history"] if metric in h]
         if not pts:
             continue
-        xs, ys = zip(*pts)
+        # The logger clock starts at process launch, so the step-0 entry carries model
+        # loading plus the baseline eval. Subtract it or every arm appears to burn a few
+        # minutes before it has trained anything.
+        origin = next((m for m, _, s in pts if s == 0), 0.0)
+        xs = [m - origin for m, _, _ in pts]
+        ys = [v for _, v, _ in pts]
         highlight = run in ("grpo", "reverse_kl_opd_plus", "sft_more_data")
         ax.plot(
             xs, ys,
@@ -170,7 +175,10 @@ def plot_cost_curve(summaries: dict[str, dict], out: Path, metric: str) -> None:
             alpha=1.0 if highlight else 0.55,
             label=PRETTY.get(run, run),
         )
-    ax.set_xlabel("A100 minutes of post-training (from the shared SFT-init checkpoint)")
+    ax.set_xlabel(
+        "A100 minutes since the shared SFT-init checkpoint\n"
+        "(rollouts + teacher scoring + updates + periodic eval; identical overhead per arm)"
+    )
     ax.set_ylabel(f"GSM8K {metric}")
     ax.set_title("Accuracy per GPU-minute: dense teacher signal vs sparse outcome reward")
     ax.legend(fontsize=8)
