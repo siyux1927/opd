@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+checkpoints/
+results/
+results_smoke/
+figures/
+train.log
+.ipynb_checkpoints/
