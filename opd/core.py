@@ -11,9 +11,13 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 DTYPE = torch.bfloat16
+
+_TF_VERSION = tuple(int(p) for p in transformers.__version__.split(".")[:2] if p.isdigit())
+_DTYPE_KWARG = "dtype" if _TF_VERSION >= (4, 56) else "torch_dtype"
 
 
 def set_seed(seed: int) -> None:
@@ -33,9 +37,9 @@ def load_tokenizer(name_or_path: str):
 def load_model(name_or_path: str, *, trainable: bool, device: str = "cuda"):
     model = AutoModelForCausalLM.from_pretrained(
         name_or_path,
-        torch_dtype=DTYPE,
         trust_remote_code=True,
         attn_implementation="sdpa",
+        **{_DTYPE_KWARG: DTYPE},
     )
     model.to(device)
     if trainable:
@@ -149,6 +153,7 @@ def generate_rollouts(
     *,
     group_size: int,
     max_new_tokens: int,
+    stop_id: int,
     gen_batch_size: int = 64,
     device: str = "cuda",
     student_prompt_fn,
@@ -175,7 +180,7 @@ def generate_rollouts(
         expanded_gold += [g] * group_size
         expanded_prompt += [p] * group_size
 
-    eos_id = student_tok.eos_token_id
+    eos_id = stop_id
     pad_id = student_tok.pad_token_id
     responses: list[list[int]] = []
 
@@ -195,6 +200,7 @@ def generate_rollouts(
             top_k=0,
             max_new_tokens=max_new_tokens,
             pad_token_id=pad_id,
+            eos_token_id=stop_id,
         )
         new_tokens = out[:, enc["input_ids"].size(1) :]
         for row in new_tokens.tolist():

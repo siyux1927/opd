@@ -88,10 +88,18 @@ Colab 用户直接打开 `notebooks/colab_opd.ipynb`。`run_all.py` 是可续跑
 **采样必须是严格的 temperature=1.0，且不能有 top-k / top-p 截断。** 任何截断都会让实际采样分布偏离
 $p_\theta$，policy gradient 的 on-policy 假设就不成立了，而框架默认参数往往带 `top_p=0.9`。
 
-**师生 prompt 不同、response token 必须相同。** 教师是 instruct 模型，走 chat template；
-学生是 base 模型，走纯文本 completion 格式。两者对同一串 response token 分别打分——
-这要求 `align_to_student()` 把教师视角下的 logprob 正确搬到学生视角的位置上，
-因为两边 prompt 长度不同，同一个 response token 的绝对下标不一样。这是 OPD 实现里最经典的静默 bug。
+**师生必须共享同一套 prompt 渲染。** 这一点我最初做错了：为了让 instruct 教师留在它自然的上下文里，
+我让教师走 chat template、学生走纯文本 completion。看着合理，实际引入了纯格式噪声——
+学生以 `<|endoftext|>` 结束，而教师在 ChatML 上下文里几乎把全部终止概率给了 `<|im_end|>`，
+于是**每条 rollout 的终止 token 都拿到一个被钉死在裁剪边界的 log-ratio**。在 reverse KL 下
+advantage 就是 $\log u$，等于每一步都在系统性地教学生"不要停"，和推理质量毫无关系。
+Tinker 的参考实现是把学生 rollout 的整条 sequence 直接喂给 `teacher.compute_logprobs`，
+师生 token 完全一致。现在默认的 `--prompt-style chat` 与之对齐：base 学生在 SFT 阶段就学会 ChatML 格式，
+`plain` 和 `split` 保留下来作为消融。
+
+即便 prompt 一致，教师视角与学生视角的位置仍需对齐（`align_to_student()`）——
+换成其它 prompt-style 时两边长度不同，同一个 response token 的绝对下标就不一样。
+这是 OPD 实现里最经典的静默 bug，所以单独抽成了一个函数。
 
 **logprob 采集要分块。** 教师是 4B、词表 151936，一次前向的完整 logits 张量就有好几个 GB。
 `token_logprobs()` 只取 backbone 的 hidden state，再按位置分块过 `lm_head` 并立即 gather 目标 token，
@@ -103,6 +111,15 @@ $p_\theta$，policy gradient 的 on-policy 假设就不成立了，而框架默�
 
 **Forward KL 的 OPD+ advantage $u$ 是无界的**，必须裁剪 log-ratio。默认 clip 到 $\pm 6$
 （即 $u \le 403$），并把 `clip_frac` 作为一等指标逐步记录——这是判断 forward KL 是否要炸的先行指标。
+对 reward 做裁剪并非权宜之计：REOPOLD 用的 "mixture-based reward clipping to prevent over-trust of
+extreme teacher signals" 就是同一类手段。
+
+**教师监督在师生分布差距大的地方本就不可靠**，这是 strong-to-weak OPD 的已知问题而不是实现瑕疵。
+FiRe-OPD 的说法是：教师 log-probability 低意味着"教师在给一种它不熟悉的推理风格打分"，
+强行蒸馏会造成负迁移；它按归一化 teacher log-prob 丢掉最差 20% 的轨迹，消融显示这是全部收益里最大的一块。
+综述另外归纳了 flawed prefix trap 与 local teachability collapse 两个更细的失效模式，
+后者明确标注为 strong-to-weak 特有。本项目记录 `clip_frac` 与 `teacher_kl` 正是为了量化这个效应，
+轨迹级过滤留作后续方向。
 
 **梯度检查点与 KV cache 冲突。** 训练时开 gradient checkpointing、`use_cache=False`；
 rollout 和评测前显式关掉并切 `eval()`，否则 transformers 会静默强制 `use_cache=False`，
@@ -128,4 +145,6 @@ tests/             用 autograd 校验 advantage 公式的单测
 - Kevin Lu and Thinking Machines Lab. *On-Policy Distillation.* Connectionism, Oct 2025.
 - Zhao, Chen, Lin, Winata, Yao, Tang. *OPD+: Rethinking the Advantage Design for On-Policy Distillation.* arXiv:2606.01039.
 - Agarwal et al. *On-Policy Distillation of Language Models (GKD).* ICLR 2024.
+- Li et al. *Filter, Then Reweight: Rethinking Optimization Granularity in On-Policy Distillation.* arXiv:2606.02684.
 - *A Survey of On-Policy Distillation for Large Language Models.* arXiv:2604.00626.
+- Busbridge et al. *Distillation Scaling Laws.* 2025（capacity gap：教师过强时 forward KL 的 mode-covering 压力会放大差距）。
