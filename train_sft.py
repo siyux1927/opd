@@ -16,18 +16,18 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from opd.core import MetricLogger, gpu_memory_gb, load_model, load_tokenizer, resolve_device, set_seed
-from opd.data import Example, load_gsm8k, render_target, student_prompt
+from opd.data import Example, PromptSpec, assert_same_vocab, load_gsm8k
 from opd.evaluate import evaluate_model
 
 
 class SFTDataset(Dataset):
-    def __init__(self, tokenizer, examples: list[Example], max_length: int):
+    def __init__(self, tokenizer, examples: list[Example], max_length: int, spec: PromptSpec):
         self.rows = []
         for ex in examples:
-            prompt_ids = tokenizer(student_prompt(ex.question), add_special_tokens=False)["input_ids"]
+            prompt_ids = tokenizer(spec.student_prompt(ex.question), add_special_tokens=False)["input_ids"]
             target_ids = tokenizer(
-                render_target(ex.reference, ex.answer), add_special_tokens=False
-            )["input_ids"] + [tokenizer.eos_token_id]
+                spec.target(ex.reference, ex.answer), add_special_tokens=False
+            )["input_ids"] + [spec.stop_id]
             ids = (prompt_ids + target_ids)[:max_length]
             labels = ([-100] * len(prompt_ids) + target_ids)[:max_length]
             self.rows.append((ids, labels))
@@ -65,6 +65,10 @@ def main() -> None:
     p.add_argument("--max-length", type=int, default=512)
     p.add_argument("--eval-limit", type=int, default=200)
     p.add_argument("--eval-k", type=int, default=4)
+    p.add_argument("--eval-batch-size", type=int, default=256)
+    p.add_argument("--prompt-style", choices=["chat", "plain", "split"], default="chat")
+    p.add_argument("--template-model", default="Qwen/Qwen3-4B-Instruct-2507",
+                   help="tokenizer that owns the chat template; must share the student's vocab")
     p.add_argument("--out", default="checkpoints/sft_init")
     p.add_argument("--results-dir", default="results")
     p.add_argument("--seed", type=int, default=0)
@@ -78,11 +82,18 @@ def main() -> None:
     tokenizer = load_tokenizer(args.model)
     model = load_model(args.init_from or args.model, trainable=True, device=device)
 
+    if args.prompt_style == "plain":
+        spec = PromptSpec.build("plain", tokenizer, tokenizer)
+    else:
+        template_tok = load_tokenizer(args.template_model)
+        assert_same_vocab(tokenizer, template_tok)
+        spec = PromptSpec.build(args.prompt_style, template_tok, tokenizer)
+
     train_pool = load_gsm8k("train", limit=args.skip_examples + args.num_examples, seed=args.seed)
     train_examples = train_pool[args.skip_examples :]
     test_examples = load_gsm8k("test", limit=args.eval_limit, seed=123)
 
-    dataset = SFTDataset(tokenizer, train_examples, args.max_length)
+    dataset = SFTDataset(tokenizer, train_examples, args.max_length, spec)
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -111,9 +122,12 @@ def main() -> None:
                 optimizer.zero_grad(set_to_none=True)
                 step += 1
                 if step % 10 == 0:
-                    logger.log(step, loss=float(loss), lr=scheduler.get_last_lr()[0])
+                    logger.log(step, loss=float(loss.detach()), lr=scheduler.get_last_lr()[0])
 
-    metrics = evaluate_model(model, tokenizer, test_examples, k=args.eval_k, device=device)
+    metrics = evaluate_model(
+        model, tokenizer, test_examples, spec, k=args.eval_k, device=device,
+        batch_size=args.eval_batch_size,
+    )
     metrics["train_minutes"] = logger.elapsed_minutes
     metrics["peak_mem_gb"] = gpu_memory_gb()
     logger.log(step, **metrics)

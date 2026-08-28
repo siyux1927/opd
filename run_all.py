@@ -20,13 +20,25 @@ P0_GRID = [("reverse_kl", "opd"), ("reverse_kl", "opd_plus"), ("forward_kl", "op
 P1_GRID = [("jsd", "opd"), ("jsd", "opd_plus")]
 
 
-def build_jobs(tier: str, steps: int, eval_limit: int, sft_examples: int) -> list[tuple[str, list[str]]]:
-    common = ["--teacher", TEACHER, "--student", SFT_CKPT, "--steps", str(steps), "--eval-limit", str(eval_limit)]
+def build_jobs(
+    tier: str, steps: int, eval_limit: int, sft_examples: int, results_dir: str, prompt_style: str
+) -> list[tuple[str, list[str]]]:
+    # results_dir and the checkpoint path must both reach every child process. Otherwise a
+    # smoke run writes into the default locations and the real run silently skips those
+    # arms and trains from the 200-example smoke checkpoint.
+    sft_ckpt = f"{SFT_CKPT}_smoke" if tier == "smoke" else SFT_CKPT
+    common = [
+        "--teacher", TEACHER, "--student", sft_ckpt, "--steps", str(steps),
+        "--eval-limit", str(eval_limit), "--results-dir", results_dir,
+        "--prompt-style", prompt_style,
+    ]
     jobs: list[tuple[str, list[str]]] = [
         (
             "sft_init",
             [sys.executable, "train_sft.py", "--model", STUDENT_BASE, "--run-name", "sft_init",
-             "--num-examples", str(sft_examples), "--out", SFT_CKPT, "--eval-limit", str(eval_limit)],
+             "--num-examples", str(sft_examples), "--out", sft_ckpt,
+             "--eval-limit", str(eval_limit), "--results-dir", results_dir,
+             "--prompt-style", prompt_style, "--template-model", TEACHER],
         )
     ]
 
@@ -46,10 +58,11 @@ def build_jobs(tier: str, steps: int, eval_limit: int, sft_examples: int) -> lis
     if tier in ("p2", "all"):
         jobs.append(
             ("sft_more_data",
-             [sys.executable, "train_sft.py", "--model", STUDENT_BASE, "--init-from", SFT_CKPT,
+             [sys.executable, "train_sft.py", "--model", STUDENT_BASE, "--init-from", sft_ckpt,
               "--run-name", "sft_more_data", "--num-examples", str(sft_examples * 2),
               "--skip-examples", str(sft_examples), "--out", "checkpoints/sft_more_data",
-              "--eval-limit", str(eval_limit)])
+              "--eval-limit", str(eval_limit), "--results-dir", results_dir,
+              "--prompt-style", prompt_style, "--template-model", TEACHER])
         )
         jobs.append(
             ("grpo",
@@ -65,6 +78,7 @@ def main() -> None:
     p.add_argument("--eval-limit", type=int, default=200)
     p.add_argument("--sft-examples", type=int, default=2000)
     p.add_argument("--results-dir", default="results")
+    p.add_argument("--prompt-style", choices=["chat", "plain", "split"], default="chat")
     p.add_argument("--force", action="store_true")
     args = p.parse_args()
 
@@ -74,7 +88,9 @@ def main() -> None:
     results = Path(args.results_dir)
     results.mkdir(parents=True, exist_ok=True)
 
-    jobs = build_jobs(args.tier, args.steps, args.eval_limit, args.sft_examples)
+    jobs = build_jobs(
+        args.tier, args.steps, args.eval_limit, args.sft_examples, args.results_dir, args.prompt_style
+    )
     for name, cmd in jobs:
         marker = results / f"{name}_final.json"
         if marker.exists() and not args.force:

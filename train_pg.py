@@ -33,13 +33,7 @@ from opd.core import (
     set_seed,
     token_logprobs,
 )
-from opd.data import (
-    assert_same_vocab,
-    is_correct,
-    load_gsm8k,
-    student_prompt,
-    teacher_prompt,
-)
+from opd.data import PromptSpec, assert_same_vocab, is_correct, load_gsm8k
 from opd.divergences import compute_advantages
 from opd.evaluate import evaluate_model
 
@@ -70,14 +64,19 @@ def main() -> None:
     p.add_argument("--group-size", type=int, default=4)
     p.add_argument("--max-new-tokens", type=int, default=288)
     p.add_argument("--gen-batch-size", type=int, default=64)
-    p.add_argument("--micro-batch-size", type=int, default=4)
+    p.add_argument("--micro-batch-size", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-5)
     p.add_argument("--warmup-steps", type=int, default=3)
     p.add_argument("--log-ratio-clip", type=float, default=6.0)
     p.add_argument("--prompt-offset", type=int, default=6000)
-    p.add_argument("--eval-every", type=int, default=10)
+    p.add_argument("--eval-every", type=int, default=20)
     p.add_argument("--eval-limit", type=int, default=200)
     p.add_argument("--eval-k", type=int, default=4)
+    # Evaluation dominates wall clock, and it only needs inference memory. On a 40GB A100
+    # the training peak is under 17GB, so the eval batch can be far larger than the default.
+    p.add_argument("--eval-batch-size", type=int, default=256)
+    p.add_argument("--eval-max-new-tokens", type=int, default=320)
+    p.add_argument("--prompt-style", choices=["chat", "plain", "split"], default="chat")
     p.add_argument("--results-dir", default="results")
     p.add_argument("--save-dir", default=None)
     p.add_argument("--seed", type=int, default=0)
@@ -94,10 +93,14 @@ def main() -> None:
     student_tok = load_tokenizer(args.student)
     student = load_model(args.student, trainable=True, device=device)
 
-    teacher = teacher_tok = None
+    # The teacher tokenizer is loaded even for GRPO: it owns the chat template, so it is
+    # what keeps the prompt format identical across every arm.
+    teacher_tok = load_tokenizer(args.teacher)
+    assert_same_vocab(student_tok, teacher_tok)
+    spec = PromptSpec.build(args.prompt_style, teacher_tok, student_tok)
+
+    teacher = None
     if args.objective == "opd":
-        teacher_tok = load_tokenizer(args.teacher)
-        assert_same_vocab(student_tok, teacher_tok)
         teacher = load_model(args.teacher, trainable=False, device=device)
 
     prompts_pool = load_gsm8k("train", limit=args.prompt_offset + args.steps * args.groups_per_batch * 2, seed=args.seed)
@@ -114,7 +117,16 @@ def main() -> None:
     best = {"avg@%d" % args.eval_k: -1.0}
 
     def run_eval(step: int) -> dict:
-        metrics = evaluate_model(student, student_tok, test_examples, k=args.eval_k, device=device)
+        metrics = evaluate_model(
+            student,
+            student_tok,
+            test_examples,
+            spec,
+            k=args.eval_k,
+            device=device,
+            batch_size=args.eval_batch_size,
+            max_new_tokens=args.eval_max_new_tokens,
+        )
         metrics["minutes"] = logger.elapsed_minutes
         logger.log(step, phase="eval", **metrics)
         history.append({"step": step, **metrics})
@@ -134,15 +146,16 @@ def main() -> None:
         batch = generate_rollouts(
             student,
             student_tok,
-            teacher_tok or student_tok,
+            teacher_tok,
             [e.question for e in chosen],
             [e.answer for e in chosen],
             group_size=args.group_size,
             max_new_tokens=args.max_new_tokens,
+            stop_id=spec.stop_id,
             gen_batch_size=args.gen_batch_size,
             device=device,
-            student_prompt_fn=student_prompt,
-            teacher_prompt_fn=teacher_prompt if teacher_tok else (lambda tok, q: student_prompt(q)),
+            student_prompt_fn=spec.student_prompt,
+            teacher_prompt_fn=spec.teacher_prompt,
         )
 
         student_logp_old = batched_token_logprobs(
@@ -193,7 +206,7 @@ def main() -> None:
             ratio = torch.exp(logp_new - student_logp_old[sl].detach())
             loss = -(ratio * advantages[sl].detach() * mask).sum() / total_tokens
             loss.backward()
-            loss_value += float(loss)
+            loss_value += float(loss.detach())
 
         grad_norm = torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
         optimizer.step()
@@ -218,6 +231,7 @@ def main() -> None:
         "arm": args.objective,
         "divergence": args.divergence if args.objective == "opd" else None,
         "mode": args.mode if args.objective == "opd" else None,
+        "prompt_style": args.prompt_style,
         "steps": args.steps,
         "rollouts": args.steps * args.groups_per_batch * args.group_size,
         "train_minutes": logger.elapsed_minutes,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from .data import Example, is_correct, student_prompt
+from .data import Example, PromptSpec, is_correct
 
 
 @torch.no_grad()
@@ -12,13 +12,14 @@ def evaluate_model(
     model,
     tokenizer,
     examples: list[Example],
+    prompt_spec: PromptSpec,
     *,
     k: int = 4,
     temperature: float = 0.7,
     top_p: float = 0.95,
     greedy: bool = True,
     max_new_tokens: int = 320,
-    batch_size: int = 64,
+    batch_size: int = 256,
     device: str = "cuda",
 ) -> dict:
     """avg@k accuracy plus a greedy pass, matching the OPD+ paper's avg@n protocol."""
@@ -29,23 +30,24 @@ def evaluate_model(
     model.config.use_cache = True
     tokenizer.padding_side = "left"
 
-    prompts = [student_prompt(e.question) for e in examples]
+    prompts = [prompt_spec.student_prompt(e.question) for e in examples]
     golds = [e.answer for e in examples]
+    stop_id = prompt_spec.stop_id
 
     results = {}
     if greedy:
         gens = _generate(
-            model, tokenizer, prompts, 1, max_new_tokens, batch_size, device,
+            model, tokenizer, prompts, 1, max_new_tokens, batch_size, device, stop_id,
             do_sample=False,
         )
         results["greedy_acc"] = sum(
             is_correct(g[0], gold) for g, gold in zip(gens, golds)
         ) / len(golds)
-        results["greedy_len"] = sum(len(g[0]) for g in gens) / len(gens)
+        results["greedy_len_chars"] = sum(len(g[0]) for g in gens) / len(gens)
 
     if k > 0:
         gens = _generate(
-            model, tokenizer, prompts, k, max_new_tokens, batch_size, device,
+            model, tokenizer, prompts, k, max_new_tokens, batch_size, device, stop_id,
             do_sample=True, temperature=temperature, top_p=top_p,
         )
         per_example = [
@@ -66,7 +68,7 @@ def evaluate_model(
 
 
 def _generate(
-    model, tokenizer, prompts, num_return, max_new_tokens, batch_size, device, **gen_kwargs
+    model, tokenizer, prompts, num_return, max_new_tokens, batch_size, device, stop_id, **gen_kwargs
 ) -> list[list[str]]:
     out: list[list[str]] = []
     eff_batch = max(1, batch_size // max(1, num_return))
@@ -80,6 +82,7 @@ def _generate(
             num_return_sequences=num_return,
             max_new_tokens=max_new_tokens,
             pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=stop_id,
             **gen_kwargs,
         )
         new_tokens = seqs[:, enc["input_ids"].size(1) :]
