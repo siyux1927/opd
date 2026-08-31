@@ -200,7 +200,11 @@ report/REPORT.md   完整技术报告
 notebooks/         Colab 入口
 ```
 
-## 8. 参考
+## 8. 许可
+
+Apache License 2.0，与 Qwen3 模型权重的许可一致。见 [`LICENSE`](LICENSE)。
+
+## 9. 参考
 
 - Kevin Lu and Thinking Machines Lab. *On-Policy Distillation.* Connectionism, Oct 2025.
 - Zhao, Chen, Lin, Winata, Yao, Tang. *OPD+: Rethinking the Advantage Design for On-Policy Distillation.* arXiv:2606.01039.
