@@ -188,6 +188,63 @@ def plot_cost_curve(summaries: dict[str, dict], out: Path, metric: str) -> None:
     plt.close(fig)
 
 
+def _load_train_metrics(results: Path) -> dict[str, list[dict]]:
+    path = results / "metrics.jsonl"
+    if not path.exists():
+        return {}
+    per_run: dict[str, list[dict]] = {}
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            record = json.loads(line)
+            if record.get("phase") == "train":
+                per_run.setdefault(record["run"], []).append(record)
+    return per_run
+
+
+def plot_training_diagnostics(results: Path, out: Path) -> None:
+    """The mechanism behind the accuracy table: gradient scale, agreement, and degeneracy.
+
+    Accuracy says the correction works; these four panels say why. The gradient norm in
+    particular separates the two regimes by two orders of magnitude while leaving reverse
+    KL untouched, which is exactly what a constant-baseline correction should do.
+    """
+    per_run = _load_train_metrics(results)
+    if not per_run:
+        return
+
+    panels = [
+        ("grad_norm", "gradient norm (log scale)", True),
+        ("teacher_kl", "per-token reverse KL to teacher", False),
+        ("clip_frac", "fraction of tokens hitting the log-ratio clip", False),
+        ("resp_len", "mean response length (tokens)", False),
+    ]
+    fig, axes = plt.subplots(2, 2, figsize=(13, 7.5))
+
+    for ax, (key, title, log_y) in zip(axes.ravel(), panels):
+        for run in ARM_ORDER:
+            records = per_run.get(run)
+            if not records:
+                continue
+            pts = [(r["step"], r[key]) for r in records if key in r]
+            if not pts:
+                continue
+            xs, ys = zip(*pts)
+            divergence = run.rsplit("_opd", 1)[0] if "_opd" in run else None
+            color = COLORS.get(divergence, "#6b7280")
+            style = "-" if run.endswith("_opd_plus") else "--"
+            ax.plot(xs, ys, style, color=color, lw=1.6, alpha=0.9, label=PRETTY.get(run, run))
+        if log_y:
+            ax.set_yscale("log")
+        ax.set_xlabel("on-policy step")
+        ax.set_title(title, fontsize=10)
+        ax.grid(alpha=0.25)
+    axes[0][0].legend(fontsize=7.5, ncol=2)
+    fig.suptitle("Dashed = stop-gradient OPD, solid = gradient-faithful OPD+", fontsize=11)
+    fig.tight_layout()
+    fig.savefig(out / "fig5_training_diagnostics.png", dpi=160)
+    plt.close(fig)
+
+
 def write_table(summaries: dict[str, dict], out: Path, metric: str) -> None:
     lines = [
         f"| Arm | Divergence | Advantage | {metric} (best) | greedy | A100 min | rollouts |",
@@ -227,6 +284,7 @@ def main() -> None:
 
     plot_weight_functions(out)
     plot_ratio_histograms(results, out)
+    plot_training_diagnostics(results, out)
     summaries = load_summaries(results)
     if summaries:
         plot_training_curves(summaries, out, args.metric)

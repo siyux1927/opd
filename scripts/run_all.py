@@ -1,7 +1,9 @@
 """Sequential orchestration of every arm. Resumable: finished arms are skipped.
 
-    python run_all.py --tier smoke   # ~6 min, proves the pipeline end to end
-    python run_all.py --tier all     # full P0 + P1 + P2 grid
+Run from the repo root so that the `opd` package is importable:
+
+    python -m scripts.run_all --tier smoke   # ~8 min, proves the pipeline end to end
+    python -m scripts.run_all --tier all     # full P0 + P1 + P2 grid
 """
 
 from __future__ import annotations
@@ -19,6 +21,10 @@ SFT_CKPT = "checkpoints/sft_init"
 P0_GRID = [("reverse_kl", "opd"), ("reverse_kl", "opd_plus"), ("forward_kl", "opd"), ("forward_kl", "opd_plus")]
 P1_GRID = [("jsd", "opd"), ("jsd", "opd_plus")]
 
+# Children are launched as modules, not paths, so they resolve `opd` from the repo root.
+SFT = [sys.executable, "-m", "scripts.train_sft"]
+PG = [sys.executable, "-m", "scripts.train_pg"]
+
 
 def build_jobs(
     tier: str, steps: int, eval_limit: int, sft_examples: int, results_dir: str, prompt_style: str
@@ -35,7 +41,7 @@ def build_jobs(
     jobs: list[tuple[str, list[str]]] = [
         (
             "sft_init",
-            [sys.executable, "train_sft.py", "--model", STUDENT_BASE, "--run-name", "sft_init",
+            SFT + ["--model", STUDENT_BASE, "--run-name", "sft_init",
              "--num-examples", str(sft_examples), "--out", sft_ckpt,
              "--eval-limit", str(eval_limit), "--results-dir", results_dir,
              "--prompt-style", prompt_style, "--template-model", TEACHER],
@@ -51,14 +57,14 @@ def build_jobs(
     for divergence, mode in grid:
         run = f"{divergence}_{mode}"
         jobs.append(
-            (run, [sys.executable, "train_pg.py", "--objective", "opd",
+            (run, PG + ["--objective", "opd",
                    "--divergence", divergence, "--mode", mode, "--run-name", run] + common)
         )
 
     if tier in ("p2", "all"):
         jobs.append(
             ("sft_more_data",
-             [sys.executable, "train_sft.py", "--model", STUDENT_BASE, "--init-from", sft_ckpt,
+             SFT + ["--model", STUDENT_BASE, "--init-from", sft_ckpt,
               "--run-name", "sft_more_data", "--num-examples", str(sft_examples * 2),
               "--skip-examples", str(sft_examples), "--out", "checkpoints/sft_more_data",
               "--eval-limit", str(eval_limit), "--results-dir", results_dir,
@@ -66,7 +72,7 @@ def build_jobs(
         )
         jobs.append(
             ("grpo",
-             [sys.executable, "train_pg.py", "--objective", "grpo", "--run-name", "grpo"] + common)
+             PG + ["--objective", "grpo", "--run-name", "grpo"] + common)
         )
     return jobs
 
@@ -104,7 +110,7 @@ def main() -> None:
             sys.exit(proc.returncode)
         print(f"== {name} done in {(time.time() - t0) / 60:.1f} min", flush=True)
 
-    subprocess.run([sys.executable, "make_plots.py", "--results-dir", args.results_dir])
+    subprocess.run([sys.executable, "-m", "scripts.make_plots", "--results-dir", args.results_dir])
 
 
 if __name__ == "__main__":

@@ -66,22 +66,73 @@ advantage 变成单调正的无界推力，方向才是对的。
 - 教师 Qwen3-4B-Instruct-2507，学生 Qwen3-0.6B-Base，同族共享 tokenizer（启动时 `assert_same_vocab` 强校验）
 - 每步 16 道题 × 4 条 rollout = 64 条序列，40 步，`max_new_tokens=288`
 - 评测：GSM8K test 200 题，avg@4（temp 0.7）+ greedy pass@1
-- 结果表见 `figures/results_table.md`，训练曲线 `fig3`，成本-效果曲线 `fig4`
+- 结果表见 `figures/results_table.md`，训练曲线 `fig3`，成本-效果曲线 `fig4`，训练诊断 `fig5`
 
-## 4. 快速开始
+## 4. 结果
+
+九个臂共享同一 SFT-init checkpoint 与同一份 rollout 预算（每臂 2560 条），总耗时 2 小时 15 分。
+按 avg@4 选取最优 checkpoint：
+
+| 臂 | avg@4 | Δ | greedy | pass@4 |
+| --- | --- | --- | --- | --- |
+| SFT-init（共同起点） | 0.331 | — | 0.490 | 0.660 |
+| +2× off-policy SFT 数据 | 0.366 | +0.035 | 0.550 | 0.690 |
+| GRPO（结果奖励 RL） | 0.404 | +0.073 | 0.540 | 0.700 |
+| Reverse KL / OPD | **0.494** | **+0.163** | **0.585** | 0.790 |
+| Reverse KL / OPD+ | 0.472 | +0.141 | 0.555 | 0.735 |
+| Forward KL / OPD | 0.331 | 0.000 | 0.490 | 0.660 |
+| Forward KL / OPD+ | 0.450 | +0.119 | 0.470 | 0.785 |
+| JSD / OPD | 0.331 | 0.000 | 0.490 | 0.660 |
+| JSD / OPD+ | 0.460 | +0.129 | 0.405 | **0.795** |
+
+forward KL 与 JSD 的 OPD 臂最优点都落在 step 0，即全程未超过起点；它们的实际终点是 0.039 与 0.134。
+avg@4 在 200 题上的标准误约 ±0.03，差距小于约 0.06 的一律不作结论。
+
+**崩溃与救活完整复现。** forward KL 在 20 步内损失 88% 的相对准确率且不再恢复，
+JSD 跌到 0.134；换成 $w_f(u)$ 后分别回到 0.450 与 0.460。
+
+**梯度尺度给出了机理层面的证据，比准确率更硬。**
+
+| 臂 | 平均梯度范数 | 平均 `adv_absmax` |
+| --- | --- | --- |
+| Reverse KL / OPD → OPD+ | 15.4 → 18.0（几乎不变） | 6.00 → 7.00 |
+| Forward KL / OPD → OPD+ | **1941.7 → 13.8（140×）** | 2026.6 → 171.7 |
+| JSD / OPD → OPD+ | **92.7 → 1.25（74×）** | 65.0 → 2.01 |
+
+修正项对 reverse KL 是常数、不改变梯度，对其余散度不是——理论的可证伪预言在数据里精确成立。
+`adv_absmax` 那两个数还提供了肉眼可读的验证：Reverse KL / OPD 恒为 6.000（clip 边界），
+OPD+ 恒为 7.000（clip + 1），论文中抽象的常数 $-1$ 直接可见。
+
+**被优化的目标本身在反向移动。** 健康臂的 per-token teacher KL 从 0.90 单调降到约 0.50，
+两条崩溃臂反而升到 1.35 与 1.55——它们不是学得慢，是在远离教师。
+两者的退化形态还相反：forward KL 的响应长度从 169 涨到 287（上限 288，即永不终止），
+JSD 从 148 塌缩到 75。
+
+![training diagnostics](figures/fig5_training_diagnostics.png)
+
+**同等预算下稠密信号显著优于稀疏奖励。** reverse KL / OPD 用 1280 条 rollout 达到 0.494，
+高于 GRPO 用 2560 条的 0.404，而教师前向只占单步开销的 11%（18.1 s 对 16.1 s）。
+省的不是采样成本，是达到同等效果所需的步数。「多喂 off-policy 数据」则收效甚微（+0.035，落在噪声内）。
+
+![cost efficiency](figures/fig4_cost_efficiency.png)
+
+完整分析、局限与后续方向见 [`report/REPORT.md`](report/REPORT.md)。
+
+## 5. 快速开始
 
 ```bash
 pip install -r requirements.txt
-python -m pytest tests -q          # CPU，验证 advantage 公式与 autograd 一致
-python run_all.py --tier smoke     # ~8 min，端到端冒烟
-python run_all.py --tier all       # 完整九臂
-python make_plots.py               # 出图与结果表
+python -m pytest tests -q               # CPU，验证 advantage 公式与 autograd 一致
+python -m scripts.run_all --tier smoke  # ~8 min，端到端冒烟
+python -m scripts.run_all --tier all    # 完整九臂
+python -m scripts.make_plots            # 出图与结果表
 ```
 
-Colab 用户直接打开 `notebooks/colab_opd.ipynb`。`run_all.py` 是可续跑的——
+全部脚本以模块方式从仓库根目录运行，这样 `opd` 包才能被正确导入。
+Colab 用户直接打开 `notebooks/colab_opd.ipynb`。`run_all` 是可续跑的——
 已有 `results/{arm}_final.json` 的臂会被跳过，适配 Colab 掉线。
 
-## 5. 工程实现要点
+## 6. 工程实现要点
 
 手写而非调库，是因为这几个点调库时容易被藏住，而它们恰恰是 OPD 能不能训对的关键。
 
@@ -125,7 +176,7 @@ FiRe-OPD 的说法是：教师 log-probability 低意味着"教师在给一种�
 rollout 和评测前显式关掉并切 `eval()`，否则 transformers 会静默强制 `use_cache=False`，
 解码速度掉一个数量级。
 
-## 6. 目录结构
+## 7. 目录结构
 
 ```
 opd/
@@ -133,14 +184,18 @@ opd/
   core.py          模型加载、分块 logprob、on-policy rollout、师生视角对齐
   data.py          GSM8K 加载、师生两套 prompt 渲染、答案抽取与判分
   evaluate.py      avg@k / greedy 评测
-train_sft.py       学生初始化 + off-policy 对照臂
-train_pg.py        OPD / OPD+ / GRPO 共用的 policy-gradient 主循环
-run_all.py         九臂顺序编排，可续跑
-make_plots.py      四张图 + markdown 结果表
+scripts/
+  train_sft.py     学生初始化 + off-policy 对照臂
+  train_pg.py      OPD / OPD+ / GRPO 共用的 policy-gradient 主循环
+  run_all.py       九臂顺序编排，可续跑
+  make_plots.py    五张图 + markdown 结果表
 tests/             用 autograd 校验 advantage 公式的单测
+figures/           复现出的五张图与结果表
+report/REPORT.md   完整技术报告
+notebooks/         Colab 入口
 ```
 
-## 7. 参考
+## 8. 参考
 
 - Kevin Lu and Thinking Machines Lab. *On-Policy Distillation.* Connectionism, Oct 2025.
 - Zhao, Chen, Lin, Winata, Yao, Tang. *OPD+: Rethinking the Advantage Design for On-Policy Distillation.* arXiv:2606.01039.
