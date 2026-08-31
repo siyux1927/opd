@@ -158,10 +158,15 @@ def plot_cost_curve(summaries: dict[str, dict], out: Path, metric: str) -> None:
         payload = summaries.get(run)
         if not payload or not payload.get("history"):
             continue
-        pts = [(h.get("minutes", 0.0), h[metric]) for h in payload["history"] if metric in h]
+        pts = [(h.get("minutes", 0.0), h[metric], h.get("step")) for h in payload["history"] if metric in h]
         if not pts:
             continue
-        xs, ys = zip(*pts)
+        # The logger clock starts at process launch, so the step-0 entry carries model
+        # loading plus the baseline eval. Subtract it or every arm appears to burn a few
+        # minutes before it has trained anything.
+        origin = next((m for m, _, s in pts if s == 0), 0.0)
+        xs = [m - origin for m, _, _ in pts]
+        ys = [v for _, v, _ in pts]
         highlight = run in ("grpo", "reverse_kl_opd_plus", "sft_more_data")
         ax.plot(
             xs, ys,
@@ -170,13 +175,73 @@ def plot_cost_curve(summaries: dict[str, dict], out: Path, metric: str) -> None:
             alpha=1.0 if highlight else 0.55,
             label=PRETTY.get(run, run),
         )
-    ax.set_xlabel("A100 minutes of post-training (from the shared SFT-init checkpoint)")
+    ax.set_xlabel(
+        "A100 minutes since the shared SFT-init checkpoint\n"
+        "(rollouts + teacher scoring + updates + periodic eval; identical overhead per arm)"
+    )
     ax.set_ylabel(f"GSM8K {metric}")
     ax.set_title("Accuracy per GPU-minute: dense teacher signal vs sparse outcome reward")
     ax.legend(fontsize=8)
     ax.grid(alpha=0.25)
     fig.tight_layout()
     fig.savefig(out / "fig4_cost_efficiency.png", dpi=160)
+    plt.close(fig)
+
+
+def _load_train_metrics(results: Path) -> dict[str, list[dict]]:
+    path = results / "metrics.jsonl"
+    if not path.exists():
+        return {}
+    per_run: dict[str, list[dict]] = {}
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            record = json.loads(line)
+            if record.get("phase") == "train":
+                per_run.setdefault(record["run"], []).append(record)
+    return per_run
+
+
+def plot_training_diagnostics(results: Path, out: Path) -> None:
+    """The mechanism behind the accuracy table: gradient scale, agreement, and degeneracy.
+
+    Accuracy says the correction works; these four panels say why. The gradient norm in
+    particular separates the two regimes by two orders of magnitude while leaving reverse
+    KL untouched, which is exactly what a constant-baseline correction should do.
+    """
+    per_run = _load_train_metrics(results)
+    if not per_run:
+        return
+
+    panels = [
+        ("grad_norm", "gradient norm (log scale)", True),
+        ("teacher_kl", "per-token reverse KL to teacher", False),
+        ("clip_frac", "fraction of tokens hitting the log-ratio clip", False),
+        ("resp_len", "mean response length (tokens)", False),
+    ]
+    fig, axes = plt.subplots(2, 2, figsize=(13, 7.5))
+
+    for ax, (key, title, log_y) in zip(axes.ravel(), panels):
+        for run in ARM_ORDER:
+            records = per_run.get(run)
+            if not records:
+                continue
+            pts = [(r["step"], r[key]) for r in records if key in r]
+            if not pts:
+                continue
+            xs, ys = zip(*pts)
+            divergence = run.rsplit("_opd", 1)[0] if "_opd" in run else None
+            color = COLORS.get(divergence, "#6b7280")
+            style = "-" if run.endswith("_opd_plus") else "--"
+            ax.plot(xs, ys, style, color=color, lw=1.6, alpha=0.9, label=PRETTY.get(run, run))
+        if log_y:
+            ax.set_yscale("log")
+        ax.set_xlabel("on-policy step")
+        ax.set_title(title, fontsize=10)
+        ax.grid(alpha=0.25)
+    axes[0][0].legend(fontsize=7.5, ncol=2)
+    fig.suptitle("Dashed = stop-gradient OPD, solid = gradient-faithful OPD+", fontsize=11)
+    fig.tight_layout()
+    fig.savefig(out / "fig5_training_diagnostics.png", dpi=160)
     plt.close(fig)
 
 
@@ -219,6 +284,7 @@ def main() -> None:
 
     plot_weight_functions(out)
     plot_ratio_histograms(results, out)
+    plot_training_diagnostics(results, out)
     summaries = load_summaries(results)
     if summaries:
         plot_training_curves(summaries, out, args.metric)
